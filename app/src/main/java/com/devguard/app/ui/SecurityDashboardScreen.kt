@@ -70,7 +70,7 @@ fun SecurityDashboardScreen(
             fontWeight = FontWeight.Bold
         )
         Text(
-            text = "NS Secure Monitor-Only • अन्य ऐप्स बैकग्राउंड पर Auto-Block",
+            text = "Vivo व Android सिस्टम छोड़कर सभी पुराने/नए ऐप्स की निगरानी",
             color = Color(0xFF9BA3B4),
             fontSize = 12.sp
         )
@@ -88,7 +88,7 @@ fun SecurityDashboardScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "NS Secure की हर गतिविधि देखने और बैकग्राउंड डेटा ब्लॉक करने के लिए इसे चालू करें।",
+                        text = "NS Secure और सभी ऐप्स की हर गतिविधि देखने के लिए इसे चालू करें।",
                         color = Color(0xFFE0E0E0),
                         fontSize = 12.sp
                     )
@@ -118,7 +118,7 @@ fun SecurityDashboardScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = if (isVpnActive) "VPN फ़िल्टर चालू (Chrome/Dev सुरक्षित)" else "VPN फ़िल्टर बंद",
+                            text = if (isVpnActive) "VPN फ़िल्टर चालू (Chrome सुरक्षित)" else "VPN फ़िल्टर बंद",
                             color = Color(0xFF9BA3B4),
                             fontSize = 12.sp
                         )
@@ -140,7 +140,7 @@ fun SecurityDashboardScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Chrome, डाउनलोड व टेस्ट ऐप्स सुरक्षित", color = Color.White, fontSize = 13.sp)
+                    Text("मेरे Debug/Test ऐप्स को ऑटो-ब्लॉक से बचाएं", color = Color.White, fontSize = 13.sp)
                     Switch(checked = config.devSafeModeEnabled, onCheckedChange = onToggleDevSafe)
                 }
 
@@ -206,16 +206,18 @@ private fun AppPolicyRow(
         TrustCategory.EMI_ADMIN_MONITOR_ONLY -> Color(0xFFFACC15)
         TrustCategory.BLOCKED_BLACKHOLE -> Color(0xFFF87171)
         TrustCategory.WATCHED_DEFAULT -> Color(0xFFCBD5E1)
+        TrustCategory.DEV_TEST_MONITOR -> Color(0xFF38BDF8)
         TrustCategory.TRUSTED_ALLOW -> Color(0xFF4ADE80)
-        TrustCategory.DEV_SAFE_BYPASS -> Color(0xFF38BDF8)
+        TrustCategory.BROWSER_SAFE_ALLOW -> Color(0xFF60A5FA)
     }
 
     val statusText = when (app.category) {
         TrustCategory.EMI_ADMIN_MONITOR_ONLY -> "Monitor-Only (केवल सूचना, ब्लॉक नहीं)"
         TrustCategory.BLOCKED_BLACKHOLE -> "BLOCKED (इंटरनेट बंद)"
         TrustCategory.WATCHED_DEFAULT -> "Watched (बैकग्राउंड डेटा पर ब्लॉक)"
+        TrustCategory.DEV_TEST_MONITOR -> "Dev/Test Monitor (निगरानी चालू)"
         TrustCategory.TRUSTED_ALLOW -> "Trusted (अनुमति प्राप्त)"
-        TrustCategory.DEV_SAFE_BYPASS -> "Dev/Browser Safe (पूर्ण छूट)"
+        TrustCategory.BROWSER_SAFE_ALLOW -> "Browser Safe (सुरक्षित)"
     }
 
     Card(
@@ -239,7 +241,7 @@ private fun AppPolicyRow(
             }
 
             if (app.category != TrustCategory.EMI_ADMIN_MONITOR_ONLY &&
-                app.category != TrustCategory.DEV_SAFE_BYPASS
+                app.category != TrustCategory.BROWSER_SAFE_ALLOW
             ) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
