@@ -14,12 +14,10 @@ class DevSafePolicy(private val context: Context) {
 
     private val prefs = context.getSharedPreferences("devguard_policy", Context.MODE_PRIVATE)
 
-    // Google Chrome को ब्राउज़र काम के लिए सुरक्षित रखें
     private val browserSafePackages = setOf(
         "com.android.chrome"
     )
 
-    // Vivo और हार्डवेयर OEM सिस्टम पैकेज (इन्हें निगरानी से बाहर रखा जाएगा)
     private val vivoAndOemPrefixes = listOf(
         "com.vivo.",
         "com.bbk.",
@@ -29,12 +27,53 @@ class DevSafePolicy(private val context: Context) {
         "com.qti."
     )
 
-    // डिफ़ॉल्ट भरोसेमंद कम्युनिकेशन व पेमेंट ऐप्स (चाहें तो UI से Trust हटा सकते हैं)
+    // प्रमुख बैंक, UPI, सरकारी सेवाएं, सोशल मीडिया और रोज़मर्रा के बड़े ऐप्स (कभी ऑटो-ब्लॉक नहीं होंगे)
     private val defaultTrustedPackages = setOf(
-        "com.whatsapp",
+        // बैंक, UPI और सरकारी ऐप्स
+        "com.kotak811mobilebankingapp.instantsavingsupiscanandpayrecharge",
+        "com.msf.kbank.mobile",
         "com.phonepe.app",
         "com.google.android.apps.nbu.paisa.user",
-        "net.one97.paytm"
+        "net.one97.paytm",
+        "in.org.npci.upiapp",
+        "com.sbi.lotusintouch",
+        "com.sbi.SBIFreedomPlus",
+        "com.snapwork.hdfc",
+        "com.csam.icici.bank.imobile",
+        "com.axis.mobile",
+        "com.dreamplug.androidapp",
+        "in.gov.uidai.pehchaan",
+        "com.digilocker.android",
+
+        // प्रमुख सोशल मीडिया, मैसेजिंग और AI ऐप्स
+        "com.whatsapp",
+        "com.whatsapp.w4b",
+        "com.facebook.katana",
+        "com.facebook.lite",
+        "com.facebook.orca",
+        "com.facebook.stella",
+        "com.instagram.android",
+        "com.instagram.barcelona",
+        "org.telegram.messenger",
+        "com.linkedin.android",
+        "com.pinterest",
+        "com.twitter.android",
+        "com.snapchat.android",
+        "com.openai.chatgpt",
+        "com.google.android.apps.bard",
+        "com.google.android.youtube",
+
+        // शॉपिंग, टेलीकॉम और ट्रैवल
+        "in.amazon.mShop.android.shopping",
+        "com.flipkart.android",
+        "com.jio.myjio",
+        "com.myairtelapp",
+        "com.ixigo.train.ixitrain",
+        "cris.org.in.prs.ima",
+        "com.application.zomato",
+        "in.swiggy.android",
+        "com.ubercab",
+        "com.olacabs.customer"
     )
 
     private val customDevPrefixes = listOf(
@@ -44,19 +83,27 @@ class DevSafePolicy(private val context: Context) {
         "com.survivalpath"
     )
 
-    fun getBlockedPackages(): Set<String> {
-        return prefs.getStringSet("blocked_pkgs", emptySet())?.toSet() ?: emptySet()
+    fun getTrustedPackages(): Set<String> {
+        val userTrusted = prefs.getStringSet("user_trusted_pkgs", emptySet()) ?: emptySet()
+        val untrustedOverrides = prefs.getStringSet("untrusted_overrides", emptySet()) ?: emptySet()
+        return (defaultTrustedPackages + userTrusted) - untrustedOverrides
     }
 
-    fun getTrustedPackages(): Set<String> {
-        return prefs.getStringSet("trusted_pkgs", defaultTrustedPackages)?.toSet()
-            ?: defaultTrustedPackages
+    fun getBlockedPackages(): Set<String> {
+        val rawBlocked = prefs.getStringSet("blocked_pkgs", emptySet())?.toSet() ?: emptySet()
+        val trusted = getTrustedPackages()
+        // पिछले वर्जन से गलती से ब्लॉक हुए बड़े ऐप्स को अपने आप अनब्लॉक करें
+        val cleanedBlocked = rawBlocked.filterNot { it in trusted || isNonBlockable(it) }.toSet()
+        if (cleanedBlocked.size != rawBlocked.size) {
+            prefs.edit().putStringSet("blocked_pkgs", cleanedBlocked).apply()
+        }
+        return cleanedBlocked
     }
 
     fun getConfig(): GuardConfig {
         return GuardConfig(
             nsSecureBgAlertBytes = prefs.getLong("ns_alert_b", 1024L),
-            bgAutoBlockThresholdBytes = prefs.getLong("bg_block_b", 4096L),
+            bgAutoBlockThresholdBytes = prefs.getLong("bg_block_kb", 300L) * 1024L,
             mediaAlertThresholdBytes = prefs.getLong("media_kb", 300L) * 1024L,
             autoBlockBackgroundApps = prefs.getBoolean("auto_block", true),
             devSafeModeEnabled = prefs.getBoolean("dev_safe", true)
@@ -70,23 +117,45 @@ class DevSafePolicy(private val context: Context) {
             .apply()
     }
 
-    fun setAppBlocked(packageName: String, block: Boolean): Boolean {
+    fun setAppBlocked(packageName: String, block: Boolean, fromAutoBlock: Boolean = false): Boolean {
         if (isNonBlockable(packageName)) return false
+        if (fromAutoBlock && packageName in getTrustedPackages()) return false
+
         val current = getBlockedPackages().toMutableSet()
-        if (block) current.add(packageName) else current.remove(packageName)
+        if (block) {
+            if (!fromAutoBlock && packageName in getTrustedPackages()) {
+                setAppTrusted(packageName, false)
+            }
+            current.add(packageName)
+        } else {
+            current.remove(packageName)
+        }
         prefs.edit().putStringSet("blocked_pkgs", current).apply()
         return true
     }
 
     fun setAppTrusted(packageName: String, trust: Boolean) {
-        val trusted = getTrustedPackages().toMutableSet()
+        val userTrusted = (prefs.getStringSet("user_trusted_pkgs", emptySet()) ?: emptySet()).toMutableSet()
+        val untrustedOverrides = (prefs.getStringSet("untrusted_overrides", emptySet()) ?: emptySet()).toMutableSet()
+
         if (trust) {
-            trusted.add(packageName)
-            setAppBlocked(packageName, false)
+            userTrusted.add(packageName)
+            untrustedOverrides.remove(packageName)
+            val blocked = getBlockedPackages().toMutableSet()
+            if (blocked.remove(packageName)) {
+                prefs.edit().putStringSet("blocked_pkgs", blocked).apply()
+            }
         } else {
-            trusted.remove(packageName)
+            userTrusted.remove(packageName)
+            if (packageName in defaultTrustedPackages) {
+                untrustedOverrides.add(packageName)
+            }
         }
-        prefs.edit().putStringSet("trusted_pkgs", trusted).apply()
+
+        prefs.edit()
+            .putStringSet("user_trusted_pkgs", userTrusted)
+            .putStringSet("untrusted_overrides", untrustedOverrides)
+            .apply()
     }
 
     fun isNonBlockable(packageName: String): Boolean {
@@ -125,16 +194,13 @@ class DevSafePolicy(private val context: Context) {
             val label = pm.getApplicationLabel(info).toString()
             val isDebuggable = (info.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
-            // 1. पहले NS Secure / Device Admin की पहचान (ताकि यह कभी बाहर न हो)
             val isAdmin = pkg in activeAdmins ||
                 label.contains("NS Secure", ignoreCase = true) ||
                 pkg.contains("nssecure", ignoreCase = true)
 
             if (!isAdmin) {
-                // 2. Vivo और Android सिस्टम ऐप्स को निगरानी लिस्ट से बाहर करें
                 if (isVivoOrAndroidSystem(pm, info)) return@mapNotNull null
 
-                // 3. बिना इंटरनेट और बिना आइकन वाले खाली पैकेज छोड़ें
                 val hasInternet = pm.checkPermission(Manifest.permission.INTERNET, pkg) ==
                     PackageManager.PERMISSION_GRANTED
                 val hasLauncher = pm.getLaunchIntentForPackage(pkg) != null
