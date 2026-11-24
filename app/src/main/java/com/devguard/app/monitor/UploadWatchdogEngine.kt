@@ -1,10 +1,14 @@
 package com.devguard.app.monitor
 
+import android.app.AppOpsManager
 import android.app.usage.NetworkStats
 import android.app.usage.NetworkStatsManager
 import android.content.Context
 import android.net.ConnectivityManager
+import android.os.Build
+import android.os.Process
 import com.devguard.app.model.AlertSeverity
+import com.devguard.app.model.DataActivityType
 import com.devguard.app.model.MonitoredAppInfo
 import com.devguard.app.model.TrustCategory
 import com.devguard.app.model.UploadAlertEvent
@@ -19,9 +23,13 @@ class UploadWatchdogEngine(
     private val foregroundTracker = ForegroundTracker(context)
 
     private val baselineTxByUid = mutableMapOf<Int, Long>()
+    private val baselineRxByUid = mutableMapOf<Int, Long>()
     private val windowTxByUid = mutableMapOf<Int, Long>()
+    private val windowRxByUid = mutableMapOf<Int, Long>()
+    private val lastActivityByUid = mutableMapOf<Int, DataActivityType>()
     private val lastMonitorAlertMs = mutableMapOf<Int, Long>()
     private val baselineStartMs = System.currentTimeMillis() - 10_000L
+    private var isBaselineInitialized = false
 
     data class ScanResult(
         val updatedApps: List<MonitoredAppInfo>,
@@ -30,128 +38,170 @@ class UploadWatchdogEngine(
     )
 
     fun scanTraffic(): ScanResult {
-        val now = System.currentTimeMillis()
-        val uidTotals = queryUidTrafficTotals(baselineStartMs, now)
-        val userState = foregroundTracker.getCurrentState()
         val apps = policy.loadMonitoredApps()
+        if (!hasUsageStatsPermission()) {
+            return ScanResult(apps, emptyList(), false)
+        }
+
+        val now = System.currentTimeMillis()
+        val uidTotals = queryUidTrafficTotals(baselineStartMs, now) ?: return ScanResult(apps, emptyList(), false)
+        val userState = foregroundTracker.getCurrentState()
         val config = policy.getConfig()
         val newAlerts = mutableListOf<UploadAlertEvent>()
         var blockedChanged = false
+
+        // पहली रीडिंग केवल शुरुआती बेसलाइन के लिए लें, ताकि पुराने डेटा से कोई ऐप ब्लॉक न हो
+        if (!isBaselineInitialized) {
+            val initializedApps = apps.map { app ->
+                val totals = uidTotals[app.uid] ?: (0L to 0L)
+                baselineTxByUid[app.uid] = totals.first
+                baselineRxByUid[app.uid] = totals.second
+                windowTxByUid[app.uid] = 0L
+                windowRxByUid[app.uid] = 0L
+                val initialType = TrafficClassifier.classify(totals.first, totals.second)
+                lastActivityByUid[app.uid] = initialType
+                app.copy(
+                    sessionUploadBytes = totals.first,
+                    sessionDownloadBytes = totals.second,
+                    lastBurstUploadBytes = 0L,
+                    lastActivityType = initialType
+                )
+            }
+            isBaselineInitialized = true
+            return ScanResult(initializedApps, emptyList(), false)
+        }
 
         val updatedApps = apps.map { app ->
             val totals = uidTotals[app.uid] ?: (0L to 0L)
             val currentTx = totals.first
             val currentRx = totals.second
 
-            val previousTx = baselineTxByUid[app.uid]
-            val deltaTx = if (previousTx == null) 0L else (currentTx - previousTx).coerceAtLeast(0L)
+            val prevTx = baselineTxByUid[app.uid]
+            val prevRx = baselineRxByUid[app.uid]
+            val deltaTx = if (prevTx == null) 0L else (currentTx - prevTx).coerceAtLeast(0L)
+            val deltaRx = if (prevRx == null) 0L else (currentRx - prevRx).coerceAtLeast(0L)
             baselineTxByUid[app.uid] = currentTx
+            baselineRxByUid[app.uid] = currentRx
 
-            val accumulatedBurst = (windowTxByUid[app.uid] ?: 0L) + deltaTx
-            windowTxByUid[app.uid] = accumulatedBurst
+            val burstTx = (windowTxByUid[app.uid] ?: 0L) + deltaTx
+            val burstRx = (windowRxByUid[app.uid] ?: 0L) + deltaRx
+            windowTxByUid[app.uid] = burstTx
+            windowRxByUid[app.uid] = burstRx
+
+            val detectedType = if (burstTx > 0L || burstRx > 0L) {
+                TrafficClassifier.classify(burstTx, burstRx).also {
+                    lastActivityByUid[app.uid] = it
+                }
+            } else {
+                lastActivityByUid[app.uid] ?: DataActivityType.IDLE
+            }
 
             val isUserUsingApp = app.packageName == userState.activeForegroundPackage ||
                 app.packageName in userState.recentlyActivePackages
 
+            val severity = when (detectedType) {
+                DataActivityType.LARGE_VIDEO_OR_BACKUP,
+                DataActivityType.LARGE_AUDIO_OR_HEAVY_MEDIA,
+                DataActivityType.PHOTO_OR_SMALL_AUDIO -> AlertSeverity.MEDIA_UPLOAD_HIGH
+                DataActivityType.TEXT_OR_API_SYNC -> AlertSeverity.TEXT_OR_METADATA_SPIKE
+                else -> AlertSeverity.INFO
+            }
+
             when (app.category) {
                 TrustCategory.EMI_ADMIN_MONITOR_ONLY -> {
                     val lastNotified = lastMonitorAlertMs[app.uid] ?: 0L
-                    if (accumulatedBurst >= config.nsSecureBgAlertBytes && (now - lastNotified) >= 15_000L) {
-                        val severity = when {
-                            accumulatedBurst >= config.mediaAlertThresholdBytes -> AlertSeverity.MEDIA_UPLOAD_HIGH
-                            accumulatedBurst >= 50L * 1024L -> AlertSeverity.TEXT_OR_METADATA_SPIKE
-                            else -> AlertSeverity.INFO
-                        }
+                    if (burstTx >= config.nsSecureBgAlertBytes && (now - lastNotified) >= 15_000L) {
                         val screenTag = if (!userState.isScreenUnlockedAndOn) "स्क्रीन बंद होने पर" else "बैकग्राउंड में"
-                        val detail = when (severity) {
-                            AlertSeverity.MEDIA_UPLOAD_HIGH -> "बड़ा डेटा/मीडिया संभावित (ब्लॉक नहीं किया गया)"
-                            AlertSeverity.TEXT_OR_METADATA_SPIKE -> "टेक्स्ट/सिंक डेटा भेजा (ब्लॉक नहीं किया गया)"
-                            AlertSeverity.INFO -> "बैकग्राउंड सर्वर गतिविधि (फोन लॉक से बचाने हेतु खुला रखा गया)"
-                        }
                         newAlerts.add(
                             UploadAlertEvent(
                                 packageName = app.packageName,
                                 appName = app.appName,
-                                uploadedBytes = accumulatedBurst,
+                                uploadedBytes = burstTx,
+                                downloadedBytes = burstRx,
+                                activityType = detectedType,
                                 severity = severity,
-                                actionTaken = "$screenTag • $detail"
+                                actionTaken = "$screenTag • Monitor-Only (फोन लॉक से बचाने हेतु खुला रखा गया)"
                             )
                         )
                         lastMonitorAlertMs[app.uid] = now
-                        windowTxByUid[app.uid] = 0L
+                        resetWindow(app.uid)
                     }
                 }
 
                 TrustCategory.WATCHED_DEFAULT -> {
-                    if (accumulatedBurst > 0L) {
-                        if (!isUserUsingApp &&
-                            config.autoBlockBackgroundApps &&
-                            accumulatedBurst >= config.bgAutoBlockThresholdBytes
-                        ) {
-                            if (policy.setAppBlocked(app.packageName, true)) {
-                                blockedChanged = true
-                                val screenTag = if (!userState.isScreenUnlockedAndOn) "स्क्रीन बंद होने पर" else "बैकग्राउंड में"
-                                val severity = if (accumulatedBurst >= config.mediaAlertThresholdBytes) {
-                                    AlertSeverity.MEDIA_UPLOAD_HIGH
-                                } else {
-                                    AlertSeverity.TEXT_OR_METADATA_SPIKE
-                                }
-                                newAlerts.add(
-                                    UploadAlertEvent(
-                                        packageName = app.packageName,
-                                        appName = app.appName,
-                                        uploadedBytes = accumulatedBurst,
-                                        severity = severity,
-                                        actionTaken = "$screenTag • Auto-Blocked (बैकग्राउंड डेटा रोका गया)"
-                                    )
+                    if (detectedType == DataActivityType.NORMAL_DOWNLOAD) {
+                        if (burstRx >= 300L * 1024L) resetWindow(app.uid)
+                    } else if (!isUserUsingApp &&
+                        config.autoBlockBackgroundApps &&
+                        burstTx >= config.bgAutoBlockThresholdBytes
+                    ) {
+                        if (policy.setAppBlocked(app.packageName, true, fromAutoBlock = true)) {
+                            blockedChanged = true
+                            val screenTag = if (!userState.isScreenUnlockedAndOn) "स्क्रीन बंद होने पर" else "बैकग्राउंड में"
+                            newAlerts.add(
+                                UploadAlertEvent(
+                                    packageName = app.packageName,
+                                    appName = app.appName,
+                                    uploadedBytes = burstTx,
+                                    downloadedBytes = burstRx,
+                                    activityType = detectedType,
+                                    severity = severity,
+                                    actionTaken = "$screenTag • Auto-Blocked (बैकग्राउंड अपलोड रोका गया)"
                                 )
-                                windowTxByUid[app.uid] = 0L
-                            }
-                        } else if (isUserUsingApp) {
-                            windowTxByUid[app.uid] = 0L
+                            )
+                            resetWindow(app.uid)
                         }
+                    } else if (isUserUsingApp && burstTx >= config.bgAutoBlockThresholdBytes) {
+                        resetWindow(app.uid)
                     }
                 }
 
                 TrustCategory.DEV_TEST_MONITOR -> {
-                    if (!isUserUsingApp && accumulatedBurst >= config.bgAutoBlockThresholdBytes) {
+                    if (!isUserUsingApp && burstTx >= config.bgAutoBlockThresholdBytes &&
+                        detectedType != DataActivityType.NORMAL_DOWNLOAD
+                    ) {
                         if (!config.devSafeModeEnabled && config.autoBlockBackgroundApps) {
-                            if (policy.setAppBlocked(app.packageName, true)) {
+                            if (policy.setAppBlocked(app.packageName, true, fromAutoBlock = true)) {
                                 blockedChanged = true
                                 newAlerts.add(
                                     UploadAlertEvent(
                                         packageName = app.packageName,
                                         appName = app.appName,
-                                        uploadedBytes = accumulatedBurst,
-                                        severity = AlertSeverity.TEXT_OR_METADATA_SPIKE,
+                                        uploadedBytes = burstTx,
+                                        downloadedBytes = burstRx,
+                                        activityType = detectedType,
+                                        severity = severity,
                                         actionTaken = "बैकग्राउंड में • Auto-Blocked (Dev-Safe बंद है)"
                                     )
                                 )
-                                windowTxByUid[app.uid] = 0L
+                                resetWindow(app.uid)
                             }
                         } else {
                             val lastNotified = lastMonitorAlertMs[app.uid] ?: 0L
-                            if ((now - lastNotified) >= 20_000L && accumulatedBurst >= 50L * 1024L) {
+                            if ((now - lastNotified) >= 20_000L) {
                                 newAlerts.add(
                                     UploadAlertEvent(
                                         packageName = app.packageName,
                                         appName = app.appName,
-                                        uploadedBytes = accumulatedBurst,
-                                        severity = AlertSeverity.TEXT_OR_METADATA_SPIKE,
+                                        uploadedBytes = burstTx,
+                                        downloadedBytes = burstRx,
+                                        activityType = detectedType,
+                                        severity = severity,
                                         actionTaken = "Test/Debug ऐप डेटा बाहर गया (Dev-Safe के कारण ब्लॉक नहीं)"
                                     )
                                 )
                                 lastMonitorAlertMs[app.uid] = now
-                                windowTxByUid[app.uid] = 0L
+                                resetWindow(app.uid)
                             }
                         }
                     } else if (isUserUsingApp) {
-                        windowTxByUid[app.uid] = 0L
+                        resetWindow(app.uid)
                     }
                 }
 
+                TrustCategory.TRUSTED_ALLOW,
                 TrustCategory.BROWSER_SAFE_ALLOW -> {
-                    windowTxByUid[app.uid] = 0L
+                    resetWindow(app.uid)
                 }
 
                 else -> Unit
@@ -160,15 +210,40 @@ class UploadWatchdogEngine(
             app.copy(
                 sessionUploadBytes = currentTx,
                 sessionDownloadBytes = currentRx,
-                lastBurstUploadBytes = accumulatedBurst
+                lastBurstUploadBytes = burstTx,
+                lastActivityType = detectedType
             )
         }
 
         return ScanResult(updatedApps, newAlerts, blockedChanged)
     }
 
+    private fun resetWindow(uid: Int) {
+        windowTxByUid[uid] = 0L
+        windowRxByUid[uid] = 0L
+    }
+
+    private fun hasUsageStatsPermission(): Boolean {
+        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                context.packageName
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                context.packageName
+            )
+        }
+        return mode == AppOpsManager.MODE_ALLOWED
+    }
+
     @Suppress("DEPRECATION")
-    private fun queryUidTrafficTotals(startMs: Long, endMs: Long): Map<Int, Pair<Long, Long>> {
+    private fun queryUidTrafficTotals(startMs: Long, endMs: Long): Map<Int, Pair<Long, Long>>? {
         val result = mutableMapOf<Int, Pair<Long, Long>>()
         val types = listOf(ConnectivityManager.TYPE_WIFI, ConnectivityManager.TYPE_MOBILE)
 
@@ -183,6 +258,7 @@ class UploadWatchdogEngine(
                     result[bucket.uid] = (prev.first + bucket.txBytes) to (prev.second + bucket.rxBytes)
                 }
             } catch (_: SecurityException) {
+                return null
             } catch (_: Exception) {
             } finally {
                 stats?.close()
