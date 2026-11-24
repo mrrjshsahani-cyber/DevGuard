@@ -1,10 +1,11 @@
 package com.devguard.app.policy
 
+import android.Manifest
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.os.Build
+import android.os.Process
 import com.devguard.app.model.GuardConfig
 import com.devguard.app.model.MonitoredAppInfo
 import com.devguard.app.model.TrustCategory
@@ -13,22 +14,22 @@ class DevSafePolicy(private val context: Context) {
 
     private val prefs = context.getSharedPreferences("devguard_policy", Context.MODE_PRIVATE)
 
-    // ब्राउज़र, APK डाउनलोडर/इंस्टॉलर, और डेवलपर टूल्स जिन्हें कभी ब्लॉक नहीं किया जाएगा
-    private val builtInDevAndBrowserPackages = setOf(
-        context.packageName,
-        "com.android.chrome",
-        "com.google.android.packageinstaller",
-        "com.android.packageinstaller",
-        "com.android.providers.downloads",
-        "com.android.providers.downloads.ui",
-        "com.termux",
-        "com.github.android",
-        "com.android.vending",
-        "com.google.android.gms",
-        "com.google.android.gsf"
+    // Google Chrome को ब्राउज़र काम के लिए सुरक्षित रखें
+    private val browserSafePackages = setOf(
+        "com.android.chrome"
     )
 
-    // डिफ़ॉल्ट भरोसेमंद कम्युनिकेशन व पेमेंट ऐप्स (चाहें तो UI से हटा सकते हैं)
+    // Vivo और हार्डवेयर OEM सिस्टम पैकेज (इन्हें निगरानी से बाहर रखा जाएगा)
+    private val vivoAndOemPrefixes = listOf(
+        "com.vivo.",
+        "com.bbk.",
+        "com.iqoo.",
+        "com.mediatek.",
+        "com.qualcomm.",
+        "com.qti."
+    )
+
+    // डिफ़ॉल्ट भरोसेमंद कम्युनिकेशन व पेमेंट ऐप्स (चाहें तो UI से Trust हटा सकते हैं)
     private val defaultTrustedPackages = setOf(
         "com.whatsapp",
         "com.phonepe.app",
@@ -40,15 +41,7 @@ class DevSafePolicy(private val context: Context) {
         "com.zenoedit",
         "com.dedit",
         "com.scanorder",
-        "com.survivalpath",
-        "com.devguard"
-    )
-
-    private val sideloadInstallers = setOf(
-        "com.android.chrome",
-        "com.google.android.packageinstaller",
-        "com.android.packageinstaller",
-        "com.android.shell"
+        "com.survivalpath"
     )
 
     fun getBlockedPackages(): Set<String> {
@@ -97,6 +90,9 @@ class DevSafePolicy(private val context: Context) {
     }
 
     fun isNonBlockable(packageName: String): Boolean {
+        if (packageName == context.packageName || packageName in browserSafePackages) {
+            return true
+        }
         val pm = context.packageManager
         val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
         val activeAdmins = dpm.activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
@@ -108,12 +104,7 @@ class DevSafePolicy(private val context: Context) {
             val info = pm.getApplicationInfo(packageName, 0)
             val label = pm.getApplicationLabel(info).toString()
             if (label.contains("NS Secure", ignoreCase = true)) return true
-
-            val isDebuggable = (info.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
-            val devSafeOn = getConfig().devSafeModeEnabled
-            packageName in builtInDevAndBrowserPackages ||
-                customDevPrefixes.any { packageName.startsWith(it, ignoreCase = true) } ||
-                (devSafeOn && (isDebuggable || isSideloadedTestApp(pm, packageName)))
+            isVivoOrAndroidSystem(pm, info)
         } catch (_: PackageManager.NameNotFoundException) {
             true
         }
@@ -125,36 +116,41 @@ class DevSafePolicy(private val context: Context) {
         val activeAdmins = dpm.activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
         val blocked = getBlockedPackages()
         val trusted = getTrustedPackages()
-        val devSafeOn = getConfig().devSafeModeEnabled
 
         val installed = pm.getInstalledApplications(PackageManager.GET_META_DATA)
         return installed.mapNotNull { info ->
             val pkg = info.packageName
+            if (pkg == context.packageName) return@mapNotNull null
+
             val label = pm.getApplicationLabel(info).toString()
             val isDebuggable = (info.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
-            // पहले Device Admin / NS Secure की पहचान (ताकि यह कभी Dev-Safe में न जाए)
+            // 1. पहले NS Secure / Device Admin की पहचान (ताकि यह कभी बाहर न हो)
             val isAdmin = pkg in activeAdmins ||
                 label.contains("NS Secure", ignoreCase = true) ||
                 pkg.contains("nssecure", ignoreCase = true)
 
-            val isSideloaded = if (!isAdmin && devSafeOn) isSideloadedTestApp(pm, pkg) else false
-            val isDevOrBrowser = !isAdmin && (
-                pkg in builtInDevAndBrowserPackages ||
-                    customDevPrefixes.any { pkg.startsWith(it, ignoreCase = true) } ||
-                    (devSafeOn && (isDebuggable || isSideloaded))
+            if (!isAdmin) {
+                // 2. Vivo और Android सिस्टम ऐप्स को निगरानी लिस्ट से बाहर करें
+                if (isVivoOrAndroidSystem(pm, info)) return@mapNotNull null
+
+                // 3. बिना इंटरनेट और बिना आइकन वाले खाली पैकेज छोड़ें
+                val hasInternet = pm.checkPermission(Manifest.permission.INTERNET, pkg) ==
+                    PackageManager.PERMISSION_GRANTED
+                val hasLauncher = pm.getLaunchIntentForPackage(pkg) != null
+                if (!hasInternet && !hasLauncher && pkg !in blocked) return@mapNotNull null
+            }
+
+            val isDevTestApp = !isAdmin && (
+                isDebuggable || customDevPrefixes.any { pkg.startsWith(it, ignoreCase = true) }
                 )
-
-            val isPureSystem = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                !isAdmin && pkg !in blocked
-
-            if (isPureSystem && !isDevOrBrowser) return@mapNotNull null
 
             val category = when {
                 isAdmin -> TrustCategory.EMI_ADMIN_MONITOR_ONLY
-                isDevOrBrowser -> TrustCategory.DEV_SAFE_BYPASS
+                pkg in browserSafePackages -> TrustCategory.BROWSER_SAFE_ALLOW
                 pkg in blocked -> TrustCategory.BLOCKED_BLACKHOLE
                 pkg in trusted -> TrustCategory.TRUSTED_ALLOW
+                isDevTestApp -> TrustCategory.DEV_TEST_MONITOR
                 else -> TrustCategory.WATCHED_DEFAULT
             }
 
@@ -172,18 +168,22 @@ class DevSafePolicy(private val context: Context) {
         )
     }
 
-    private fun isSideloadedTestApp(pm: PackageManager, packageName: String): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val installer = pm.getInstallSourceInfo(packageName).installingPackageName
-                installer != null && installer in sideloadInstallers
-            } else {
-                @Suppress("DEPRECATION")
-                val installer = pm.getInstallerPackageName(packageName)
-                installer != null && installer in sideloadInstallers
+    private fun isVivoOrAndroidSystem(pm: PackageManager, info: ApplicationInfo): Boolean {
+        val pkg = info.packageName
+        if (pkg in browserSafePackages) return false
+        if (info.uid < Process.FIRST_APPLICATION_UID) return true
+        if (pkg == "android") return true
+        if (vivoAndOemPrefixes.any { pkg.startsWith(it, ignoreCase = true) }) return true
+
+        val hasSystemFlag = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        if (hasSystemFlag) {
+            if (pkg.startsWith("com.android.") || pkg.startsWith("com.google.android.")) {
+                return true
             }
-        } catch (_: Exception) {
-            false
+            if (pm.getLaunchIntentForPackage(pkg) == null) {
+                return true
+            }
         }
+        return false
     }
 }
