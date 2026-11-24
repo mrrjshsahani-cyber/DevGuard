@@ -31,10 +31,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.devguard.app.model.DataActivityType
 import com.devguard.app.model.GuardConfig
 import com.devguard.app.model.MonitoredAppInfo
 import com.devguard.app.model.TrustCategory
 import com.devguard.app.model.UploadAlertEvent
+import com.devguard.app.monitor.TrafficClassifier
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -70,7 +72,7 @@ fun SecurityDashboardScreen(
             fontWeight = FontWeight.Bold
         )
         Text(
-            text = "Vivo व Android सिस्टम छोड़कर सभी पुराने/नए ऐप्स की निगरानी",
+            text = "बैंक व बड़े ऐप्स सुरक्षित • केवल अनजान बैकग्राउंड अपलोड पर रोक",
             color = Color(0xFF9BA3B4),
             fontSize = 12.sp
         )
@@ -118,7 +120,7 @@ fun SecurityDashboardScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = if (isVpnActive) "VPN फ़िल्टर चालू (Chrome सुरक्षित)" else "VPN फ़िल्टर बंद",
+                            text = if (isVpnActive) "VPN फ़िल्टर चालू (बैंक/Chrome सुरक्षित)" else "VPN फ़िल्टर बंद",
                             color = Color(0xFF9BA3B4),
                             fontSize = 12.sp
                         )
@@ -149,7 +151,7 @@ fun SecurityDashboardScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("अन्य ऐप्स बैकग्राउंड डेटा भेजें तो Block", color = Color.White, fontSize = 13.sp)
+                    Text("अनजान ऐप्स 300 KB+ बैकग्राउंड अपलोड पर Block", color = Color.White, fontSize = 13.sp)
                     Switch(checked = config.autoBlockBackgroundApps, onCheckedChange = onToggleAutoBlock)
                 }
             }
@@ -214,9 +216,9 @@ private fun AppPolicyRow(
     val statusText = when (app.category) {
         TrustCategory.EMI_ADMIN_MONITOR_ONLY -> "Monitor-Only (केवल सूचना, ब्लॉक नहीं)"
         TrustCategory.BLOCKED_BLACKHOLE -> "BLOCKED (इंटरनेट बंद)"
-        TrustCategory.WATCHED_DEFAULT -> "Watched (बैकग्राउंड डेटा पर ब्लॉक)"
+        TrustCategory.WATCHED_DEFAULT -> "Watched (300 KB+ बैकग्राउंड अपलोड पर ब्लॉक)"
         TrustCategory.DEV_TEST_MONITOR -> "Dev/Test Monitor (निगरानी चालू)"
-        TrustCategory.TRUSTED_ALLOW -> "Trusted (अनुमति प्राप्त)"
+        TrustCategory.TRUSTED_ALLOW -> "Trusted (सुरक्षित - ब्लॉक नहीं होगा)"
         TrustCategory.BROWSER_SAFE_ALLOW -> "Browser Safe (सुरक्षित)"
     }
 
@@ -233,10 +235,25 @@ private fun AppPolicyRow(
                     Text(app.appName, color = Color.White, fontWeight = FontWeight.SemiBold)
                     Text(app.packageName, color = Color(0xFF8892A6), fontSize = 11.sp)
                     Text(statusText, color = badgeColor, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    if (app.lastActivityType != DataActivityType.IDLE) {
+                        Text(
+                            text = "हाल की गतिविधि: ${app.lastActivityType.labelHindi}",
+                            color = Color(0xFF93C5FD),
+                            fontSize = 11.sp
+                        )
+                    }
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    Text("Up: ${app.sessionUploadBytes / 1024} KB", color = Color(0xFFFB923C), fontSize = 12.sp)
-                    Text("Down: ${app.sessionDownloadBytes / 1024} KB", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                    Text(
+                        "Up: ${TrafficClassifier.formatSize(app.sessionUploadBytes)}",
+                        color = Color(0xFFFB923C),
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        "Down: ${TrafficClassifier.formatSize(app.sessionDownloadBytes)}",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 11.sp
+                    )
                 }
             }
 
@@ -270,13 +287,25 @@ private fun AlertLogRow(alert: UploadAlertEvent) {
     val timeStr = remember(alert.timestamp) {
         SimpleDateFormat("dd MMM, hh:mm:ss a", Locale.getDefault()).format(Date(alert.timestamp))
     }
-    val kb = (alert.uploadedBytes / 1024L).coerceAtLeast(1L)
+    val upStr = TrafficClassifier.formatSize(alert.uploadedBytes)
+    val downStr = TrafficClassifier.formatSize(alert.downloadedBytes)
+
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF211B24)),
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
-            Text("${alert.appName} ($kb KB बाहर गया)", color = Color(0xFFFCA5A5), fontWeight = FontWeight.Bold)
+            Text(
+                text = "${alert.appName} • ${alert.activityType.labelHindi}",
+                color = Color(0xFFFCA5A5),
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = "Up: $upStr | Down: $downStr",
+                color = Color(0xFFFB923C),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
             Text(alert.actionTaken, color = Color(0xFFFDE047), fontSize = 12.sp)
             Text("${alert.packageName} • $timeStr", color = Color(0xFF94A3B8), fontSize = 11.sp)
         }
