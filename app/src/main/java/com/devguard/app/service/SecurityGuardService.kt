@@ -18,6 +18,7 @@ import com.devguard.app.MainActivity
 import com.devguard.app.model.AlertSeverity
 import com.devguard.app.model.MonitoredAppInfo
 import com.devguard.app.model.UploadAlertEvent
+import com.devguard.app.monitor.TrafficClassifier
 import com.devguard.app.monitor.UploadWatchdogEngine
 import com.devguard.app.policy.DevSafePolicy
 import com.devguard.app.vpn.SelectiveBlackholeVpnService
@@ -61,7 +62,6 @@ class SecurityGuardService : Service() {
     private lateinit var policy: DevSafePolicy
     private lateinit var watchdog: UploadWatchdogEngine
 
-    // नया ऐप डाउनलोड/इंस्टॉल होते ही तुरंत निगरानी में जोड़ने के लिए रिसीवर
     private val packageReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val action = intent?.action ?: return
@@ -72,9 +72,7 @@ class SecurityGuardService : Service() {
                     runSingleScan()
                     if (action == Intent.ACTION_PACKAGE_ADDED && !isUpdate && !pkg.isNullOrBlank()) {
                         val addedApp = _appsState.value.firstOrNull { it.packageName == pkg }
-                        if (addedApp != null) {
-                            pushNewAppNotification(addedApp)
-                        }
+                        if (addedApp != null) pushNewAppNotification(addedApp)
                     }
                 }
             }
@@ -92,12 +90,7 @@ class SecurityGuardService : Service() {
             addAction(Intent.ACTION_PACKAGE_REMOVED)
             addDataScheme("package")
         }
-        ContextCompat.registerReceiver(
-            this,
-            packageReceiver,
-            filter,
-            ContextCompat.RECEIVER_EXPORTED
-        )
+        ContextCompat.registerReceiver(this, packageReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -200,7 +193,7 @@ class SecurityGuardService : Service() {
 
     private fun pushAlertNotification(alert: UploadAlertEvent) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val kb = (alert.uploadedBytes / 1024L).coerceAtLeast(1L)
+        val sizeStr = TrafficClassifier.formatSize(alert.uploadedBytes)
         val notifId = ((alert.id % 100_000).toInt()) + 2000
 
         val openAppIntent = PendingIntent.getActivity(
@@ -211,11 +204,14 @@ class SecurityGuardService : Service() {
         )
 
         val title = when {
-            alert.actionTaken.contains("Auto-Blocked") -> "ब्लॉक किया गया: ${alert.appName}"
-            alert.severity == AlertSeverity.MEDIA_UPLOAD_HIGH -> "बड़ा अपलोड अलर्ट: ${alert.appName}"
-            else -> "${alert.appName} गतिविधि सूचना"
+            alert.actionTaken.contains("Auto-Blocked") ->
+                "ब्लॉक किया गया: ${alert.appName}"
+            alert.severity == AlertSeverity.MEDIA_UPLOAD_HIGH ->
+                "मीडिया अलर्ट: ${alert.appName}"
+            else ->
+                "${alert.appName} • ${alert.activityType.labelHindi}"
         }
-        val body = "$kb KB डेटा बाहर गया • ${alert.actionTaken}"
+        val body = "${alert.activityType.labelHindi} ($sizeStr बाहर गया) • ${alert.actionTaken}"
 
         val builder = NotificationCompat.Builder(this, CH_ALERTS)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
