@@ -3,9 +3,10 @@ package com.devguard.app.model
 enum class TrustCategory {
     EMI_ADMIN_MONITOR_ONLY, // NS Secure आदि: कभी ब्लॉक नहीं, हर गतिविधि की सूचना
     BLOCKED_BLACKHOLE,      // बैकग्राउंड डेटा भेजने पर ब्लॉक किए गए ऐप्स
-    WATCHED_DEFAULT,        // सामान्य ऐप्स: बैकग्राउंड गतिविधि पर ऑटो-ब्लॉक
+    WATCHED_DEFAULT,        // सभी सामान्य व नए डाउनलोड किए गए ऐप्स: बैकग्राउंड डेटा पर ऑटो-ब्लॉक
+    DEV_TEST_MONITOR,       // आपके Debug/Test ऐप्स: पूरी निगरानी + अलर्ट (Dev-Safe में ऑटो-ब्लॉक नहीं)
     TRUSTED_ALLOW,          // उपयोगकर्ता द्वारा भरोसेमंद (WhatsApp, UPI आदि)
-    DEV_SAFE_BYPASS         // ब्राउज़र, इंस्टॉलर व आपके Debug/Test ऐप्स (पूर्ण छूट)
+    BROWSER_SAFE_ALLOW      // Google Chrome: आपके ब्राउज़र काम के लिए सुरक्षित
 }
 
 enum class AlertSeverity {
