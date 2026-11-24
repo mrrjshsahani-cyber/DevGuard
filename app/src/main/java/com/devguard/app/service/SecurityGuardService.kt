@@ -5,11 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.devguard.app.MainActivity
 import com.devguard.app.model.AlertSeverity
 import com.devguard.app.model.MonitoredAppInfo
@@ -57,11 +61,43 @@ class SecurityGuardService : Service() {
     private lateinit var policy: DevSafePolicy
     private lateinit var watchdog: UploadWatchdogEngine
 
+    // नया ऐप डाउनलोड/इंस्टॉल होते ही तुरंत निगरानी में जोड़ने के लिए रिसीवर
+    private val packageReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (action == Intent.ACTION_PACKAGE_ADDED || action == Intent.ACTION_PACKAGE_REMOVED) {
+                val pkg = intent.data?.schemeSpecificPart
+                val isUpdate = intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)
+                serviceScope.launch {
+                    runSingleScan()
+                    if (action == Intent.ACTION_PACKAGE_ADDED && !isUpdate && !pkg.isNullOrBlank()) {
+                        val addedApp = _appsState.value.firstOrNull { it.packageName == pkg }
+                        if (addedApp != null) {
+                            pushNewAppNotification(addedApp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         policy = DevSafePolicy(this)
         watchdog = UploadWatchdogEngine(this, policy)
         createChannels()
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addDataScheme("package")
+        }
+        ContextCompat.registerReceiver(
+            this,
+            packageReceiver,
+            filter,
+            ContextCompat.RECEIVER_EXPORTED
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -94,7 +130,7 @@ class SecurityGuardService : Service() {
     }
 
     private fun ensureForeground() {
-        val notification = buildStatusNotification("NS Secure निगरानी चालू • Chrome व टेस्ट ऐप्स सुरक्षित")
+        val notification = buildStatusNotification("NS Secure व सभी यूजर/नए ऐप्स की निगरानी चालू")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(FG_NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -149,6 +185,19 @@ class SecurityGuardService : Service() {
         stopSelf()
     }
 
+    private fun pushNewAppNotification(app: MonitoredAppInfo) {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val notifId = (app.packageName.hashCode() and 0x7FFF) + 5000
+        val notif = NotificationCompat.Builder(this, CH_ALERTS)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("नया ऐप निगरानी में जोड़ा गया")
+            .setContentText("${app.appName} अब DevGuard की निगरानी में है।")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+        nm.notify(notifId, notif)
+    }
+
     private fun pushAlertNotification(alert: UploadAlertEvent) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val kb = (alert.uploadedBytes / 1024L).coerceAtLeast(1L)
@@ -164,7 +213,7 @@ class SecurityGuardService : Service() {
         val title = when {
             alert.actionTaken.contains("Auto-Blocked") -> "ब्लॉक किया गया: ${alert.appName}"
             alert.severity == AlertSeverity.MEDIA_UPLOAD_HIGH -> "बड़ा अपलोड अलर्ट: ${alert.appName}"
-            else -> "NS Secure गतिविधि सूचना"
+            else -> "${alert.appName} गतिविधि सूचना"
         }
         val body = "$kb KB डेटा बाहर गया • ${alert.actionTaken}"
 
@@ -223,6 +272,10 @@ class SecurityGuardService : Service() {
 
     override fun onDestroy() {
         _isRunning.value = false
+        try {
+            unregisterReceiver(packageReceiver)
+        } catch (_: Exception) {
+        }
         serviceScope.cancel()
         super.onDestroy()
     }
