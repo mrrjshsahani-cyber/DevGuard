@@ -20,7 +20,7 @@ class UploadWatchdogEngine(
 
     private val baselineTxByUid = mutableMapOf<Int, Long>()
     private val windowTxByUid = mutableMapOf<Int, Long>()
-    private val lastNsSecureAlertMs = mutableMapOf<Int, Long>()
+    private val lastMonitorAlertMs = mutableMapOf<Int, Long>()
     private val baselineStartMs = System.currentTimeMillis() - 10_000L
 
     data class ScanResult(
@@ -53,46 +53,20 @@ class UploadWatchdogEngine(
             val isUserUsingApp = app.packageName == userState.activeForegroundPackage ||
                 app.packageName in userState.recentlyActivePackages
 
-            if (app.category == TrustCategory.EMI_ADMIN_MONITOR_ONLY) {
-                // NS Secure: कभी ब्लॉक नहीं होगा, लेकिन बैकग्राउंड गतिविधि पर तुरंत सूचना देगा
-                val lastNotified = lastNsSecureAlertMs[app.uid] ?: 0L
-                if (accumulatedBurst >= config.nsSecureBgAlertBytes && (now - lastNotified) >= 15_000L) {
-                    val severity = when {
-                        accumulatedBurst >= config.mediaAlertThresholdBytes -> AlertSeverity.MEDIA_UPLOAD_HIGH
-                        accumulatedBurst >= 50L * 1024L -> AlertSeverity.TEXT_OR_METADATA_SPIKE
-                        else -> AlertSeverity.INFO
-                    }
-                    val screenTag = if (!userState.isScreenUnlockedAndOn) "स्क्रीन बंद होने पर" else "बैकग्राउंड में"
-                    val detail = when (severity) {
-                        AlertSeverity.MEDIA_UPLOAD_HIGH -> "बड़ा डेटा/मीडिया संभावित (ब्लॉक नहीं किया गया)"
-                        AlertSeverity.TEXT_OR_METADATA_SPIKE -> "टेक्स्ट/सिंक डेटा भेजा (ब्लॉक नहीं किया गया)"
-                        AlertSeverity.INFO -> "बैकग्राउंड सर्वर गतिविधि (फोन लॉक से बचाने हेतु खुला रखा गया)"
-                    }
-                    newAlerts.add(
-                        UploadAlertEvent(
-                            packageName = app.packageName,
-                            appName = app.appName,
-                            uploadedBytes = accumulatedBurst,
-                            severity = severity,
-                            actionTaken = "$screenTag • $detail"
-                        )
-                    )
-                    lastNsSecureAlertMs[app.uid] = now
-                    windowTxByUid[app.uid] = 0L
-                }
-            } else if (app.category == TrustCategory.WATCHED_DEFAULT && accumulatedBurst > 0L) {
-                // बाकी सामान्य ऐप्स: स्क्रीन पर खुले हैं तो छूट, बैकग्राउंड में डेटा भेजा तो तुरंत ब्लॉक
-                if (!isUserUsingApp &&
-                    config.autoBlockBackgroundApps &&
-                    accumulatedBurst >= config.bgAutoBlockThresholdBytes
-                ) {
-                    if (policy.setAppBlocked(app.packageName, true)) {
-                        blockedChanged = true
+            when (app.category) {
+                TrustCategory.EMI_ADMIN_MONITOR_ONLY -> {
+                    val lastNotified = lastMonitorAlertMs[app.uid] ?: 0L
+                    if (accumulatedBurst >= config.nsSecureBgAlertBytes && (now - lastNotified) >= 15_000L) {
+                        val severity = when {
+                            accumulatedBurst >= config.mediaAlertThresholdBytes -> AlertSeverity.MEDIA_UPLOAD_HIGH
+                            accumulatedBurst >= 50L * 1024L -> AlertSeverity.TEXT_OR_METADATA_SPIKE
+                            else -> AlertSeverity.INFO
+                        }
                         val screenTag = if (!userState.isScreenUnlockedAndOn) "स्क्रीन बंद होने पर" else "बैकग्राउंड में"
-                        val severity = if (accumulatedBurst >= config.mediaAlertThresholdBytes) {
-                            AlertSeverity.MEDIA_UPLOAD_HIGH
-                        } else {
-                            AlertSeverity.TEXT_OR_METADATA_SPIKE
+                        val detail = when (severity) {
+                            AlertSeverity.MEDIA_UPLOAD_HIGH -> "बड़ा डेटा/मीडिया संभावित (ब्लॉक नहीं किया गया)"
+                            AlertSeverity.TEXT_OR_METADATA_SPIKE -> "टेक्स्ट/सिंक डेटा भेजा (ब्लॉक नहीं किया गया)"
+                            AlertSeverity.INFO -> "बैकग्राउंड सर्वर गतिविधि (फोन लॉक से बचाने हेतु खुला रखा गया)"
                         }
                         newAlerts.add(
                             UploadAlertEvent(
@@ -100,16 +74,87 @@ class UploadWatchdogEngine(
                                 appName = app.appName,
                                 uploadedBytes = accumulatedBurst,
                                 severity = severity,
-                                actionTaken = "$screenTag • Auto-Blocked (बैकग्राउंड डेटा रोका गया)"
+                                actionTaken = "$screenTag • $detail"
                             )
                         )
+                        lastMonitorAlertMs[app.uid] = now
                         windowTxByUid[app.uid] = 0L
                     }
-                } else if (isUserUsingApp) {
+                }
+
+                TrustCategory.WATCHED_DEFAULT -> {
+                    if (accumulatedBurst > 0L) {
+                        if (!isUserUsingApp &&
+                            config.autoBlockBackgroundApps &&
+                            accumulatedBurst >= config.bgAutoBlockThresholdBytes
+                        ) {
+                            if (policy.setAppBlocked(app.packageName, true)) {
+                                blockedChanged = true
+                                val screenTag = if (!userState.isScreenUnlockedAndOn) "स्क्रीन बंद होने पर" else "बैकग्राउंड में"
+                                val severity = if (accumulatedBurst >= config.mediaAlertThresholdBytes) {
+                                    AlertSeverity.MEDIA_UPLOAD_HIGH
+                                } else {
+                                    AlertSeverity.TEXT_OR_METADATA_SPIKE
+                                }
+                                newAlerts.add(
+                                    UploadAlertEvent(
+                                        packageName = app.packageName,
+                                        appName = app.appName,
+                                        uploadedBytes = accumulatedBurst,
+                                        severity = severity,
+                                        actionTaken = "$screenTag • Auto-Blocked (बैकग्राउंड डेटा रोका गया)"
+                                    )
+                                )
+                                windowTxByUid[app.uid] = 0L
+                            }
+                        } else if (isUserUsingApp) {
+                            windowTxByUid[app.uid] = 0L
+                        }
+                    }
+                }
+
+                TrustCategory.DEV_TEST_MONITOR -> {
+                    if (!isUserUsingApp && accumulatedBurst >= config.bgAutoBlockThresholdBytes) {
+                        if (!config.devSafeModeEnabled && config.autoBlockBackgroundApps) {
+                            if (policy.setAppBlocked(app.packageName, true)) {
+                                blockedChanged = true
+                                newAlerts.add(
+                                    UploadAlertEvent(
+                                        packageName = app.packageName,
+                                        appName = app.appName,
+                                        uploadedBytes = accumulatedBurst,
+                                        severity = AlertSeverity.TEXT_OR_METADATA_SPIKE,
+                                        actionTaken = "बैकग्राउंड में • Auto-Blocked (Dev-Safe बंद है)"
+                                    )
+                                )
+                                windowTxByUid[app.uid] = 0L
+                            }
+                        } else {
+                            val lastNotified = lastMonitorAlertMs[app.uid] ?: 0L
+                            if ((now - lastNotified) >= 20_000L && accumulatedBurst >= 50L * 1024L) {
+                                newAlerts.add(
+                                    UploadAlertEvent(
+                                        packageName = app.packageName,
+                                        appName = app.appName,
+                                        uploadedBytes = accumulatedBurst,
+                                        severity = AlertSeverity.TEXT_OR_METADATA_SPIKE,
+                                        actionTaken = "Test/Debug ऐप डेटा बाहर गया (Dev-Safe के कारण ब्लॉक नहीं)"
+                                    )
+                                )
+                                lastMonitorAlertMs[app.uid] = now
+                                windowTxByUid[app.uid] = 0L
+                            }
+                        }
+                    } else if (isUserUsingApp) {
+                        windowTxByUid[app.uid] = 0L
+                    }
+                }
+
+                TrustCategory.BROWSER_SAFE_ALLOW -> {
                     windowTxByUid[app.uid] = 0L
                 }
-            } else if (app.category == TrustCategory.DEV_SAFE_BYPASS) {
-                windowTxByUid[app.uid] = 0L
+
+                else -> Unit
             }
 
             app.copy(
